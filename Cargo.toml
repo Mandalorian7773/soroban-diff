@@ -1,0 +1,12 @@
+[package]
+name = "soroban-diff"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "soroban-diff"
+path = "src/main.rs"
+
+[dependencies]
+# No external dependencies — std-only by design.
+# serde / serde_json reserved for future --json output flag.
