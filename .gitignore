@@ -1,1 +1,3 @@
-/target
+target/
+contracts/*/rust/target/
+*.wasm
