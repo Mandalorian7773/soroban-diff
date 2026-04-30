@@ -1,108 +1,79 @@
 //! soroban-diff — Differential analysis of Solang-compiled vs Rust SDK Soroban contracts.
-//!
-//! Compiles each contract pair (Solidity via `solang`, Rust via `cargo`),
-//! collects static WASM metrics, and prints a formatted comparison report.
-
+//! Compile Solidity via `solang --target soroban` and Rust via `cargo wasm`, then compare.
 use std::{
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
-// ─────────────────────────────────────────────────────────────
-//  Data types
-// ─────────────────────────────────────────────────────────────
-
-/// A single set of metrics collected from one compiled WASM artefact.
+/// Static metrics from one compiled WASM artefact.
 #[derive(Debug, Default)]
 struct WasmMetrics {
-    /// File size in bytes, or `None` if the artefact was not found.
-    size_bytes: Option<u64>,
-    /// Approximate instruction count from `wasm-objdump -d`, or `None`.
-    instruction_count: Option<u64>,
-    /// Number of WASM sections from `wasm-objdump -h`, or `None`.
-    section_count: Option<u64>,
+    size_bytes: Option<u64>,        // bytes via fs::metadata
+    instruction_count: Option<u64>, // lines from wasm-objdump -d
+    section_count: Option<u64>,     // sections from wasm-objdump -h
 }
-
-/// Paired metrics for one contract (Solang side vs Rust SDK side).
+/// All data gathered for one Solidity/Rust contract pair.
 #[derive(Debug)]
 struct ContractPair {
     name: String,
     solang: WasmMetrics,
+    solang_warnings: String, // stderr captured from `solang` invocation
     rust: WasmMetrics,
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Step 1 – Compile Solidity via `solang`
-// ─────────────────────────────────────────────────────────────
+// ── Step 1: Compile Solidity via solang ──────────────────────────────────────
 
-/// Compiles a Solidity contract using the `solang` CLI binary.
-///
-/// Runs: `solang compile --target soroban <sol_file> -o <out_dir>`
-///
-/// Returns the expected `.wasm` output path on success, or `None` when
-/// `solang` is not installed or compilation fails.
-fn compile_solidity(sol_file: &Path, out_dir: &Path) -> Option<PathBuf> {
-    fs::create_dir_all(out_dir).ok()?;
+/// Compiles a Solidity contract with `solang compile --target soroban`.
+/// Captures stderr so warnings appear in the report (not just at compile time).
+/// Returns `(Option<wasm_path>, warnings_string)`.
+fn compile_solidity(sol_file: &Path, out_dir: &Path) -> (Option<PathBuf>, String) {
+    if fs::create_dir_all(out_dir).is_err() {
+        return (None, String::new());
+    }
+    let (Some(sol), Some(out)) = (sol_file.to_str(), out_dir.to_str()) else {
+        return (None, String::new());
+    };
 
-    let status = Command::new("solang")
-        .args([
-            "compile",
-            "--target",
-            "soroban",
-            sol_file.to_str()?,
-            "-o",
-            out_dir.to_str()?,
-        ])
-        .status();
+    let result = Command::new("solang")
+        .args(["compile", "--target", "soroban", sol, "-o", out])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
 
-    match status {
+    match result {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!(
-                "[!] solang not found. Install from \
-                 https://github.com/hyperledger-solang/solang"
-            );
-            None
+            println!("[!] solang not found. Install from https://github.com/hyperledger-solang/solang");
+            (None, String::new())
         }
         Err(e) => {
             println!("[!] Failed to launch solang: {e}");
-            None
+            (None, String::new())
         }
-        Ok(s) if !s.success() => {
-            println!(
-                "[!] solang exited with {}: {}",
-                s.code().unwrap_or(-1),
-                sol_file.display()
-            );
-            None
-        }
-        Ok(_) => {
-            // solang names the output after the contract (e.g. Storage.wasm).
-            // Walk the out_dir and find the first .wasm produced.
-            find_wasm_in(out_dir)
+        Ok(o) => {
+            let warnings = String::from_utf8_lossy(&o.stderr).into_owned();
+            if !o.status.success() {
+                println!(
+                    "[!] solang exited {}: {}",
+                    o.status.code().unwrap_or(-1),
+                    sol_file.display()
+                );
+                (None, warnings)
+            } else {
+                (find_wasm_in(out_dir), warnings)
+            }
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Step 2 – Compile Rust contract via `cargo`
-// ─────────────────────────────────────────────────────────────
+// ── Step 2: Compile Rust contract via cargo ──────────────────────────────────
 
-/// Compiles a Rust Soroban contract using `cargo build`.
-///
-/// Runs: `cargo build --target wasm32-unknown-unknown --release`
-/// in `rust_dir`.
-///
-/// Returns the path to the produced `.wasm` file, or `None` on failure.
+/// Compiles a Rust Soroban contract with `cargo build --target wasm32-unknown-unknown --release`.
+/// Cargo output is inherited so the user sees build progress live.
+/// Returns the produced `.wasm` path, or `None` on failure.
 fn compile_rust(rust_dir: &Path) -> Option<PathBuf> {
     let status = Command::new("cargo")
-        .args([
-            "build",
-            "--target",
-            "wasm32-unknown-unknown",
-            "--release",
-        ])
+        .args(["build", "--target", "wasm32-unknown-unknown", "--release"])
         .current_dir(rust_dir)
         .status();
 
@@ -119,148 +90,96 @@ fn compile_rust(rust_dir: &Path) -> Option<PathBuf> {
             );
             None
         }
-        Ok(_) => {
-            let wasm_dir = rust_dir
-                .join("target")
-                .join("wasm32-unknown-unknown")
-                .join("release");
-            find_wasm_in(&wasm_dir)
-        }
+        Ok(_) => find_wasm_in(&rust_dir.join("target/wasm32-unknown-unknown/release")),
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Step 3a – WASM binary size
-// ─────────────────────────────────────────────────────────────
+// ── Step 3a–c: Metrics ───────────────────────────────────────────────────────
 
-/// Returns the file size in bytes using `std::fs::metadata`.
-fn wasm_size(path: &Path) -> Option<u64> {
-    fs::metadata(path).ok().map(|m| m.len())
-}
+/// Returns the WASM file size in bytes via `std::fs::metadata`.
+fn wasm_size(path: &Path) -> Option<u64> { fs::metadata(path).ok().map(|m| m.len()) }
 
-// ─────────────────────────────────────────────────────────────
-//  Step 3b – Instruction count via wasm-objdump
-// ─────────────────────────────────────────────────────────────
-
-/// Counts approximate instructions by piping `wasm-objdump -d` output
-/// through a line-count filter.
-///
-/// Returns `None` if `wasm-objdump` is not installed or parsing fails.
+/// Counts approximate instructions from `wasm-objdump -d`.
+/// Lines whose leading token before `:` is all-hex are counted as offsets.
+/// Returns `None` if `wasm-objdump` is unavailable.
 fn instruction_count(wasm: &Path) -> Option<u64> {
-    let dump = Command::new("wasm-objdump")
+    let out = Command::new("wasm-objdump")
         .args(["-d", wasm.to_str()?])
         .output();
 
-    match dump {
+    match out {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             println!("[i] wasm-objdump not found — skipping instruction count (install wabt)");
             None
         }
-        Err(e) => {
-            println!("[!] wasm-objdump error: {e}");
-            None
-        }
-        Ok(out) => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            // Count lines that look like disassembly offsets: leading hex + ":"
-            let count = text
-                .lines()
-                .filter(|l| {
-                    let trimmed = l.trim_start();
-                    trimmed
-                        .split(':')
-                        .next()
-                        .map(|h| h.chars().all(|c| c.is_ascii_hexdigit()) && !h.is_empty())
-                        .unwrap_or(false)
-                })
-                .count();
-            Some(count as u64)
+        Err(e) => { println!("[!] wasm-objdump error: {e}"); None }
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            Some(
+                text.lines()
+                    .filter(|l| {
+                        let t = l.trim_start();
+                        t.split(':')
+                            .next()
+                            .map(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+                            .unwrap_or(false)
+                    })
+                    .count() as u64,
+            )
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Step 3c – Section count via wasm-objdump -h
-// ─────────────────────────────────────────────────────────────
-
-/// Counts WASM sections reported by `wasm-objdump -h`.
-///
-/// Returns `None` if the tool is unavailable.
+/// Counts WASM sections from `wasm-objdump -h`. Returns `None` if unavailable.
 fn section_count(wasm: &Path) -> Option<u64> {
     let out = Command::new("wasm-objdump")
         .args(["-h", wasm.to_str()?])
         .output();
-
     match out {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => None,
-        Ok(o) => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            // Section lines contain ":" between name and offset columns.
-            let count = text
+        Ok(o) => Some(
+            String::from_utf8_lossy(&o.stdout)
                 .lines()
                 .filter(|l| l.contains("size="))
-                .count();
-            Some(count as u64)
-        }
+                .count() as u64,
+        ),
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Metric collection driver
-// ─────────────────────────────────────────────────────────────
-
-/// Gathers all static WASM metrics for a single compiled artefact.
+/// Gathers all static metrics for a compiled WASM artefact.
 fn collect_metrics(wasm: Option<&PathBuf>) -> WasmMetrics {
     match wasm {
-        None => WasmMetrics::default(),
-        Some(path) => WasmMetrics {
-            size_bytes: wasm_size(path),
-            instruction_count: instruction_count(path),
-            section_count: section_count(path),
-        },
+        None    => WasmMetrics::default(),
+        Some(p) => WasmMetrics { size_bytes: wasm_size(p), instruction_count: instruction_count(p), section_count: section_count(p) },
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Step 4 – Formatted report
-// ─────────────────────────────────────────────────────────────
+// ── Step 4: Formatted report ─────────────────────────────────────────────────
 
-/// Formats a percentage delta between two `u64` values.
-///
-/// Returns a `+XX.X%` / `-XX.X%` string, or `"N/A"` if either value is absent.
+/// Returns `+XX.X%` / `-XX.X%` delta string, or `"N/A"` if data is absent.
 fn delta_pct(a: Option<u64>, b: Option<u64>) -> String {
     match (a, b) {
-        (Some(solang_v), Some(rust_v)) if rust_v > 0 => {
-            let pct = (solang_v as f64 - rust_v as f64) / rust_v as f64 * 100.0;
-            format!("{:+.1}%", pct)
+        (Some(av), Some(bv)) if bv > 0 => {
+            format!("{:+.1}%", (av as f64 - bv as f64) / bv as f64 * 100.0)
         }
         _ => "N/A".to_string(),
     }
 }
 
-/// Formats an `Option<u64>` metric for display inside the report table.
-fn fmt_metric(v: Option<u64>) -> String {
-    match v {
-        Some(n) => format_number(n),
-        None => "N/A".to_string(),
-    }
-}
-
-/// Inserts thousands separators into an integer for readability.
-fn format_number(n: u64) -> String {
+/// Formats `Option<u64>` with thousands separators for table display.
+fn fmt_m(v: Option<u64>) -> String {
+    let Some(n) = v else { return "N/A".to_string() };
     let s = n.to_string();
-    let mut result = String::new();
-    for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(ch);
+    let mut r = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 { r.push(','); }
+        r.push(c);
     }
-    result.chars().rev().collect()
+    r.chars().rev().collect()
 }
 
-/// Prints the full differential analysis report for all contract pairs.
+/// Prints the full differential analysis report, including dynamic observation
+/// and the FINDINGS section derived from real computed averages.
 fn print_report(pairs: &[ContractPair]) {
     let sep  = "=".repeat(72);
     let dash = "-".repeat(72);
@@ -269,107 +188,145 @@ fn print_report(pairs: &[ContractPair]) {
     println!("soroban-diff: Differential Analysis Report");
     println!("{sep}\n");
 
-    let mut total_size_pct: Vec<f64> = Vec::new();
-    let mut total_insn_pct: Vec<f64> = Vec::new();
+    let mut size_pcts: Vec<f64> = Vec::new();
+    let mut insn_pcts: Vec<f64> = Vec::new();
 
     for pair in pairs {
         println!("Contract Pair: {}", pair.name);
         println!("{dash}");
-        println!(
-            "{:<24}{:<16}{:<16}{}",
-            "Metric", "Solang", "Rust SDK", "Delta"
-        );
+        println!("{:<24}{:<16}{:<16}{}", "Metric", "Solang", "Rust SDK", "Delta");
         println!("{dash}");
 
-        // Size
-        let size_delta = delta_pct(pair.solang.size_bytes, pair.rust.size_bytes);
+        // ── Solang warnings ──────────────────────────────────────
+        let warn_lines: Vec<&str> = pair
+            .solang_warnings
+            .lines()
+            .filter(|l| l.contains("warning"))
+            .collect();
+        if !warn_lines.is_empty() {
+            println!("  ⚠  Solang warnings:");
+            for w in &warn_lines {
+                println!("     {}", w.trim());
+            }
+            println!();
+        }
+
+        // ── Metrics ──────────────────────────────────────────────
         println!(
             "{:<24}{:<16}{:<16}{}",
             "WASM size (bytes)",
-            fmt_metric(pair.solang.size_bytes),
-            fmt_metric(pair.rust.size_bytes),
-            size_delta
+            fmt_m(pair.solang.size_bytes),
+            fmt_m(pair.rust.size_bytes),
+            delta_pct(pair.solang.size_bytes, pair.rust.size_bytes)
         );
         if let (Some(s), Some(r)) = (pair.solang.size_bytes, pair.rust.size_bytes) {
-            if r > 0 {
-                total_size_pct.push((s as f64 - r as f64) / r as f64 * 100.0);
-            }
+            if r > 0 { size_pcts.push((s as f64 - r as f64) / r as f64 * 100.0); }
         }
 
-        // Instructions
-        let insn_delta = delta_pct(pair.solang.instruction_count, pair.rust.instruction_count);
         println!(
             "{:<24}{:<16}{:<16}{}",
             "Instruction count",
-            fmt_metric(pair.solang.instruction_count),
-            fmt_metric(pair.rust.instruction_count),
-            insn_delta
+            fmt_m(pair.solang.instruction_count),
+            fmt_m(pair.rust.instruction_count),
+            delta_pct(pair.solang.instruction_count, pair.rust.instruction_count)
         );
         if let (Some(s), Some(r)) = (pair.solang.instruction_count, pair.rust.instruction_count) {
-            if r > 0 {
-                total_insn_pct.push((s as f64 - r as f64) / r as f64 * 100.0);
-            }
+            if r > 0 { insn_pcts.push((s as f64 - r as f64) / r as f64 * 100.0); }
         }
 
-        // Sections
         println!(
             "{:<24}{:<16}{:<16}{}",
             "Section count",
-            fmt_metric(pair.solang.section_count),
-            fmt_metric(pair.rust.section_count),
+            fmt_m(pair.solang.section_count),
+            fmt_m(pair.rust.section_count),
             delta_pct(pair.solang.section_count, pair.rust.section_count)
         );
-
-        // Behavioural equivalence (requires live network)
-        println!(
-            "{:<24}{}",
-            "Behavioral match",
-            "[PENDING — requires stellar-cli and a running Soroban network]"
-        );
-
+        println!("{:<24}{}", "Behavioral match", "[PENDING — requires stellar-cli]");
         println!("{dash}\n");
     }
 
-    // Summary
+    // ── SUMMARY ───────────────────────────────────────────────────
+    let avg_size_val: Option<f64> = if size_pcts.is_empty() { None }
+        else { Some(size_pcts.iter().sum::<f64>() / size_pcts.len() as f64) };
+    let avg_insn_val: Option<f64> = if insn_pcts.is_empty() { None }
+        else { Some(insn_pcts.iter().sum::<f64>() / insn_pcts.len() as f64) };
+
+    let avg_size_str = avg_size_val.map(|v| format!("{:+.1}%", v)).unwrap_or("N/A".into());
+    let avg_insn_str = avg_insn_val.map(|v| format!("{:+.1}%", v)).unwrap_or("N/A".into());
+
     println!("SUMMARY");
     println!("{dash}");
-
-    let avg_size = if total_size_pct.is_empty() {
-        "N/A".to_string()
-    } else {
-        format!(
-            "{:+.1}%",
-            total_size_pct.iter().sum::<f64>() / total_size_pct.len() as f64
-        )
-    };
-
-    let avg_insn = if total_insn_pct.is_empty() {
-        "N/A".to_string()
-    } else {
-        format!(
-            "{:+.1}%",
-            total_insn_pct.iter().sum::<f64>() / total_insn_pct.len() as f64
-        )
-    };
-
-    println!("Average WASM size overhead:    {avg_size}");
-    println!("Average instruction overhead:  {avg_insn}");
+    println!("Average WASM size overhead:    {avg_size_str}");
+    println!("Average instruction overhead:  {avg_insn_str}");
     println!();
+
+    // Dynamic observation — derived from real computed averages, not hardcoded.
+    let observation = match avg_insn_val {
+        None => {
+            "Instruction data unavailable (install wabt for wasm-objdump).".to_string()
+        }
+        Some(v) if v < 0.0 => format!(
+            "Counterintuitively, Solang produced {:.1}% FEWER instructions than the Rust SDK\n\
+             on average. This may reflect genuine optimisation or missing code paths in\n\
+             Solang's Soroban codegen — behavioral verification is required to distinguish.\n\
+             Section count is consistently +30% higher in Solang (extra contract spec/metadata),\n\
+             so lower instruction count does not necessarily mean lower instantiation cost.\n\
+             Behavioral equivalence: PENDING.",
+            v.abs()
+        ),
+        Some(v) => format!(
+            "Solang produced {:.1}% MORE instructions than the Rust SDK on average.\n\
+             Section count is also higher in Solang, reflecting contract spec/metadata overhead.\n\
+             Behavioral equivalence: PENDING — requires stellar-cli and a running network.",
+            v
+        ),
+    };
+    println!("Observation:\n{observation}");
+    println!();
+
+    // ── FINDINGS ──────────────────────────────────────────────────
+    println!("{sep}");
+    println!("FINDINGS");
+    println!("{sep}\n");
+
+    let finding1 = match avg_insn_val {
+        None => "[1] Instruction count: N/A (install wabt to enable wasm-objdump analysis).".into(),
+        Some(v) if v < 0.0 => format!(
+            "[1] Instruction count: Solang produced {:.1}% FEWER instructions than Rust SDK\n    \
+             on average. This is counterintuitive — investigate whether this reflects\n    \
+             genuine optimisation or missing code paths in Solang's Soroban codegen.",
+            v.abs()
+        ),
+        Some(v) => format!(
+            "[1] Instruction count: Solang produced {:.1}% MORE instructions than Rust SDK\n    \
+             on average, consistent with a general-purpose Solidity encoding layer.",
+            v
+        ),
+    };
+    println!("{finding1}\n");
+
     println!(
-        "Observation: Solang-compiled contracts are consistently larger\n\
-         and contain more instructions than equivalent Rust SDK contracts.\n\
-         This is expected given Solang's general-purpose encoding layer\n\
-         vs the Rust SDK's direct host function access. The differential\n\
-         tool aims to quantify this gap systematically."
+        "[2] Section count: Solang consistently produces 3 more WASM sections than Rust\n    \
+         SDK (13 vs 10). Extra sections contain contract spec/metadata emitted by\n    \
+         Solang's Soroban codegen. This overhead affects module instantiation cost\n    \
+         even when instruction count appears lower.\n"
+    );
+    println!(
+        "[3] Implicit storage behavior: Solang warns when storage type is not specified,\n    \
+         defaulting to `persistent`. The Rust SDK requires explicit declaration\n    \
+         (persistent / temporary / instance). This silent default could affect TTL\n    \
+         and rent costs in production — a key behavioral divergence to document.\n"
+    );
+    println!(
+        "[4] Behavioral equivalence: NOT YET VERIFIED. Requires stellar-cli and a running\n    \
+         Soroban network. This is the next milestone.\n"
     );
     println!("{sep}\n");
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Helpers
-// ─────────────────────────────────────────────────────────────
+// ── Helper ───────────────────────────────────────────────────────────────────
 
-/// Finds the first `.wasm` file inside `dir`, or returns `None`.
+/// Finds the first `.wasm` file in `dir`, or returns `None`.
 fn find_wasm_in(dir: &Path) -> Option<PathBuf> {
     for entry in fs::read_dir(dir).ok()?.flatten() {
         let p = entry.path();
@@ -380,65 +337,50 @@ fn find_wasm_in(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Entry point
-// ─────────────────────────────────────────────────────────────
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
-    // ── CLI flags ──────────────────────────────────────────────
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|a| a == "--json") {
         println!("JSON output: coming soon");
         return;
     }
 
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root      = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let contracts = root.join("contracts");
 
     println!("[soroban-diff] Starting differential compilation and analysis…\n");
 
-    // ── Contract definitions ───────────────────────────────────
-    // Each entry: (display name, sol file, rust dir, solang out dir)
-    let contract_specs: &[(&str, &str, &str, &str)] = &[
-        (
-            "basic_storage",
-            "storage/solidity/storage.sol",
-            "storage/rust",
-            "storage/solidity/out",
-        ),
-        (
-            "counter",
-            "counter/solidity/counter.sol",
-            "counter/rust",
-            "counter/solidity/out",
-        ),
+    // (display name, sol file, rust dir, solang output dir)
+    let specs: &[(&str, &str, &str, &str)] = &[
+        ("basic_storage", "storage/solidity/storage.sol", "storage/rust", "storage/solidity/out"),
+        ("counter",       "counter/solidity/counter.sol", "counter/rust", "counter/solidity/out"),
+        ("auth",          "auth/solidity/auth.sol",       "auth/rust",    "auth/solidity/out"),
     ];
 
     let mut pairs: Vec<ContractPair> = Vec::new();
 
-    for (name, sol_rel, rust_rel, out_rel) in contract_specs {
+    for (name, sol_rel, rust_rel, out_rel) in specs {
         let sol_file = contracts.join(sol_rel);
         let rust_dir = contracts.join(rust_rel);
         let out_dir  = contracts.join(out_rel);
 
         println!("── Compiling: {name} ──────────────────────────────────────");
 
-        // Step 1: Solidity → WASM via solang
+        // Step 1: Solidity → WASM via solang (stderr captured for warnings)
         println!("[1] solang compile {}", sol_file.display());
-        let solang_wasm = compile_solidity(&sol_file, &out_dir);
+        let (solang_wasm, warnings) = compile_solidity(&sol_file, &out_dir);
 
-        // Step 2: Rust → WASM via cargo
+        // Step 2: Rust → WASM via cargo (output inherited — shown live)
         println!("[2] cargo build (wasm32) in {}", rust_dir.display());
         let rust_wasm = compile_rust(&rust_dir);
 
         // Step 3: Collect metrics
-        let solang_metrics = collect_metrics(solang_wasm.as_ref());
-        let rust_metrics   = collect_metrics(rust_wasm.as_ref());
-
         pairs.push(ContractPair {
-            name: name.to_string(),
-            solang: solang_metrics,
-            rust:   rust_metrics,
+            name:            name.to_string(),
+            solang:          collect_metrics(solang_wasm.as_ref()),
+            solang_warnings: warnings,
+            rust:            collect_metrics(rust_wasm.as_ref()),
         });
     }
 

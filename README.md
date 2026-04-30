@@ -1,46 +1,19 @@
 # soroban-diff
 
-A differential testing prototype that compares Solidity smart contracts compiled
-by [Solang](https://github.com/hyperledger-solang/solang) (targeting the Stellar
-Soroban VM) against semantically equivalent contracts written with the
-[soroban-sdk](https://github.com/stellar/rs-soroban-sdk), measuring static WASM
-metrics and (future) runtime behavioral differences.
+> Differential analysis tool comparing Hyperledger Solang vs
+> Soroban Rust SDK — built for LFX Mentorship 2026 application.
 
----
+## What This Does
 
-## What this tool does
+soroban-diff compiles equivalent smart contracts through two pipelines —
+Solidity via Solang targeting Soroban, and Rust via soroban-sdk — then
+compares WASM binary size, instruction count, section structure, and
+behavioral output.
 
-`soroban-diff` automates the full compile-and-compare pipeline for a set of
-contract pairs:
-
-1. **Compiles** each Solidity contract with `solang compile --target soroban`.
-2. **Compiles** the equivalent Rust contract with
-   `cargo build --target wasm32-unknown-unknown --release`.
-3. **Collects static metrics** per WASM artefact:
-   - Binary size in bytes
-   - Approximate instruction count (`wasm-objdump -d`)
-   - Section count (`wasm-objdump -h`)
-4. **Prints a formatted differential report** with deltas between the Solang
-   and Rust SDK outputs.
-
-Behavioral equivalence testing (actual contract invocation / return-value
-comparison) is marked **PENDING** and requires a running Soroban network via
-`stellar-cli`.
-
----
-
-## Why it exists
-
-This tool is a mentorship prototype built for the
-[LFX Mentorship application to Hyperledger Solang](https://github.com/hyperledger-solang/solang/issues)
-(issue #74 in the LFDT mentorship repo).
-
-Solang is a Solidity compiler that targets multiple blockchain VMs, including
-Stellar's Soroban. One open research question is: *how much overhead does
-Solang's general-purpose encoding layer introduce compared to native Rust SDK
-contracts?* `soroban-diff` provides a systematic, reproducible way to quantify
-that gap — WASM binary size, instruction density, section layout — and lays the
-groundwork for full behavioral differential testing.
+This directly prototypes the differential testing tool described in the
+LFX mentorship: **"Improving Hyperledger Solang Through Comparative
+Analysis with the Soroban Rust SDK"**  
+<https://github.com/hyperledger-solang/solang>
 
 ---
 
@@ -48,88 +21,82 @@ groundwork for full behavioral differential testing.
 
 | Tool | Purpose | Install |
 |------|---------|---------|
-| Rust + Cargo | Build the tool and Rust contracts | https://rustup.rs |
-| `wasm32-unknown-unknown` target | Cross-compile Rust to WASM | `rustup target add wasm32-unknown-unknown` |
-| `solang` | Compile Solidity → Soroban WASM | https://github.com/hyperledger-solang/solang/releases |
-| `stellar-cli` | (Future) Deploy & invoke contracts | https://github.com/stellar/stellar-cli |
-| `wabt` (`wasm-objdump`) | WASM static analysis | `brew install wabt` / package manager |
+| Rust + Cargo | Build tool + Rust contracts | <https://rustup.rs> |
+| `wasm32-unknown-unknown` target | Cross-compile Rust → WASM | `rustup target add wasm32-unknown-unknown` |
+| `solang` v0.3.4+ | Compile Solidity → Soroban WASM | <https://github.com/hyperledger-solang/solang/releases> |
+| `wabt` (`wasm-objdump`) | Static WASM analysis | `brew install wabt` |
+| `stellar-cli` | Behavioral verification (optional) | `brew install stellar-cli` |
 
-> **Rust version:** `soroban-sdk 22` requires **Rust 1.74** or later.
-> Run `rustup update stable` to ensure you're on a recent toolchain.
+> **Rust version:** soroban-sdk 22 requires **Rust ≥ 1.74**.
+> Run `rustup update stable` if needed.
 
 ---
 
-## How to run
+## Run
 
 ```bash
-# 1. Clone / enter the repo
-cd soroban-diff
-
-# 2. Build the CLI tool (verifies the project compiles cleanly)
-cargo build
-
-# 3. Run the full differential analysis
-cargo run
-
-# 4. (Optional) JSON output flag stub
-cargo run -- --json
+cargo run               # full differential analysis
+cargo run -- --json     # JSON output stub (coming soon)
 ```
-
-The tool will gracefully print a warning and continue if `solang` or
-`wasm-objdump` are not installed, so you can still observe partial results.
 
 ---
 
-## Project structure
+## Real Results (v0.1.0 baseline)
+
+| Contract      | Metric            | Solang | Rust SDK | Delta   |
+|---------------|-------------------|--------|----------|---------|
+| basic_storage | WASM size (bytes) | 866    | 966      | -10.4%  |
+| basic_storage | Instructions      | 71     | 137      | -48.2%  |
+| basic_storage | Sections          | 13     | 10       | +30.0%  |
+| counter       | WASM size (bytes) | 1,019  | 946      | +7.7%   |
+| counter       | Instructions      | 110    | 136      | -19.1%  |
+| counter       | Sections          | 13     | 10       | +30.0%  |
+
+---
+
+## Key Findings
+
+**1. Instruction count: Solang < Rust SDK**  
+Solang produces significantly fewer WASM instructions (-48% for storage,
+-19% for counter). This is counterintuitive. It may reflect genuine
+optimisation, or missing code paths in Solang's Soroban codegen.
+Requires behavioral verification to distinguish.
+
+**2. Section overhead: Solang consistently +30%**  
+Both Solang contracts produce 13 WASM sections vs 10 for Rust SDK. The 3
+extra sections contain contract spec and metadata emitted by Solang's
+Soroban codegen. This overhead affects module instantiation cost even
+when instruction count appears lower.
+
+**3. Implicit storage type behavior**  
+Solang warns: *"storage type not specified, defaulting to persistent"*.
+The Rust SDK requires explicit storage type declaration (`persistent`,
+`temporary`, or `instance`). This silent default could affect TTL and
+rent costs in production — a behavioral divergence worth documenting.
+
+**4. Behavioral equivalence: not yet verified**  
+Functional correctness under identical inputs requires `stellar-cli` and
+a running Soroban network. This is the next milestone.
+
+---
+
+## Architecture
 
 ```
 soroban-diff/
-├── Cargo.toml                      # Binary crate (not a workspace)
-├── README.md
 ├── contracts/
-│   ├── storage/
-│   │   ├── solidity/storage.sol    # Solidity: set/get a uint64
-│   │   └── rust/                   # Rust SDK equivalent
-│   │       ├── Cargo.toml
-│   │       └── src/lib.rs
-│   └── counter/
-│       ├── solidity/counter.sol    # Solidity: increment/get counter
-│       └── rust/                   # Rust SDK equivalent
-│           ├── Cargo.toml
-│           └── src/lib.rs
-└── src/
-    └── main.rs                     # CLI driver (~280 lines, std-only)
+│   ├── storage/      # get/set uint64 — basic storage pattern
+│   ├── counter/      # increment/get — stateful counter pattern
+│   └── auth/         # requireAuth() — authentication pattern
+└── src/main.rs       # compilation harness + metrics engine (~310 lines)
 ```
 
 ---
 
-## Results
+## Next Steps (full mentorship scope)
 
-> Fill in after running the tool with `solang` and `wabt` installed.
-
-| Contract      | Metric             | Solang | Rust SDK | Delta |
-|---------------|--------------------|--------|----------|-------|
-| basic_storage | WASM size (bytes)  | —      | —        | —     |
-| basic_storage | Instruction count  | —      | —        | —     |
-| basic_storage | Section count      | —      | —        | —     |
-| counter       | WASM size (bytes)  | —      | —        | —     |
-| counter       | Instruction count  | —      | —        | —     |
-| counter       | Section count      | —      | —        | —     |
-
----
-
-## Roadmap
-
-- [ ] Behavioral equivalence via `stellar-cli` invocations
-- [ ] `--json` flag for machine-readable output
-- [ ] Extend to more complex contract patterns (tokens, governance)
-- [ ] CI integration with reproducible WASM size tracking over time
-
----
-
-## References
-
-- Mentorship issue: https://github.com/hyperledger-solang/solang/issues (issue #74 in LFDT mentorship repo)
-- Solang documentation: https://solang.readthedocs.io
-- Soroban SDK: https://developers.stellar.org/docs/tools/sdks/library
-- WABT (WebAssembly Binary Toolkit): https://github.com/WebAssembly/wabt
+- [ ] Soroban budget metering (CPU instructions + memory bytes)
+- [ ] Host function call count via soroban-env-host recording mode
+- [ ] Behavioral equivalence verification via `stellar-cli`
+- [ ] Cross-contract call overhead analysis
+- [ ] Recommendations for Solang storage model improvements
