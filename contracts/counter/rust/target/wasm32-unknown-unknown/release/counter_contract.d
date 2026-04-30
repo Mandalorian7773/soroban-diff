@@ -1,0 +1,1 @@
+/Users/adityajagrani/Desktop/soroban-diff/contracts/counter/rust/target/wasm32-unknown-unknown/release/counter_contract.wasm: /Users/adityajagrani/Desktop/soroban-diff/contracts/counter/rust/src/lib.rs

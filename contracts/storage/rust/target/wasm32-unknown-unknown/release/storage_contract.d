@@ -1,0 +1,1 @@
+/Users/adityajagrani/Desktop/soroban-diff/contracts/storage/rust/target/wasm32-unknown-unknown/release/storage_contract.wasm: /Users/adityajagrani/Desktop/soroban-diff/contracts/storage/rust/src/lib.rs
